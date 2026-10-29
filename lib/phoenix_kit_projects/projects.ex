@@ -1978,7 +1978,7 @@ defmodule PhoenixKitProjects.Projects do
 
   @doc """
   Counts of assignments by status across active non-template projects.
-  Returns a map like %{"todo" => 5, "in_progress" => 2, "done" => 10}.
+  Returns a map like %{"waiting" => 3, "todo" => 5, "in_progress" => 2, "done" => 10}.
 
   Filters on `is_nil(p.archived_at)` to match the dashboard's intent —
   assignments inside archived projects shouldn't inflate the workload
@@ -2111,7 +2111,8 @@ defmodule PhoenixKitProjects.Projects do
       done = Map.get(c, "done", 0)
       in_progress = Map.get(c, "in_progress", 0)
       todo = Map.get(c, "todo", 0)
-      total = done + in_progress + todo
+      waiting = Map.get(c, "waiting", 0)
+      total = done + in_progress + todo + waiting
 
       progress_sum = progress_sum_by_project |> Map.get(p.uuid, 0) |> Kernel.||(0)
 
@@ -2198,7 +2199,7 @@ defmodule PhoenixKitProjects.Projects do
       %{
         project: %Project{},
         task_total: integer,            # direct tasks (assignments with a task)
-        task_done / task_in_progress / task_todo: integer,
+        task_done / task_in_progress / task_todo / task_waiting: integer,
         subproject_count: integer,      # direct sub-projects
         total: integer,                 # task_total + subproject_count
         progress_pct: integer,          # tasks (done=100) + non-empty children
@@ -2267,6 +2268,7 @@ defmodule PhoenixKitProjects.Projects do
       task_done: Enum.count(task_rows, &(&1.status == "done")),
       task_in_progress: Enum.count(task_rows, &(&1.status == "in_progress")),
       task_todo: Enum.count(task_rows, &(&1.status == "todo")),
+      task_waiting: Enum.count(task_rows, &(&1.status == "waiting")),
       subproject_count: length(link_rows),
       total: length(task_rows) + length(link_rows),
       progress_pct: node_progress(task_rows, children),
@@ -2515,7 +2517,7 @@ defmodule PhoenixKitProjects.Projects do
            %{
              "project_uuid" => project.uuid,
              "task_uuid" => a.task_uuid,
-             "status" => "todo",
+             "status" => "waiting",
              "position" => a.position,
              "description" => a.description,
              "estimated_duration" => a.estimated_duration,
@@ -4004,7 +4006,7 @@ defmodule PhoenixKitProjects.Projects do
           true ->
             case create_assignment_from_template(
                    task_uuid,
-                   %{"project_uuid" => project_uuid, "status" => "todo"},
+                   %{"project_uuid" => project_uuid, "status" => "waiting"},
                    broadcast: false
                  ) do
               {:ok, a} -> {root_acc, [a | extras_acc], Map.put(map, task_uuid, a.uuid)}
@@ -4196,6 +4198,25 @@ defmodule PhoenixKitProjects.Projects do
   def update_assignment_form(%Assignment{} = a, attrs, opts \\ []) do
     # One hand-off pass for the row and whatever the tick rules move with it.
     PhoenixKitProjects.Handoffs.batch(fn -> do_update_assignment_form(a, attrs, opts) end)
+  end
+
+  @doc """
+  Corrects when a task's work really began and ended (`started_at`,
+  `completed_at`) — a late "Done" moved back to when it happened. Only the
+  two times are written (`Assignment.times_changeset/2`: neither in the
+  future, the end not before the start); the status and who did it stay.
+  """
+  @spec correct_assignment_times(Assignment.t(), map()) ::
+          {:ok, Assignment.t()} | {:error, Ecto.Changeset.t()}
+  def correct_assignment_times(%Assignment{} = a, attrs) do
+    with {:ok, updated} <- a |> Assignment.times_changeset(attrs) |> repo().update() do
+      ProjectsPubSub.broadcast_assignment(:assignment_updated, %{
+        uuid: updated.uuid,
+        project_uuid: updated.project_uuid
+      })
+
+      {:ok, updated}
+    end
   end
 
   defp do_update_assignment_form(a, attrs, opts) do

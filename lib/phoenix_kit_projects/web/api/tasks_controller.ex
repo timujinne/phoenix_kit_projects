@@ -55,7 +55,7 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
   @max_task_minutes 6_000_000
   @units ~w(minutes hours days weeks fortnights months years)
 
-  @status_filters ~w(todo in_progress done open)
+  @status_filters ~w(waiting todo in_progress done open)
 
   def index(conn, params) do
     with {:ok, conn} <- Json.scope_project(conn, params),
@@ -245,7 +245,7 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
      })}
   end
 
-  defp filter_status(tasks, status) when status in ["todo", "in_progress", "done"],
+  defp filter_status(tasks, status) when status in ["waiting", "todo", "in_progress", "done"],
     do: Enum.filter(tasks, &(&1.status == status))
 
   defp filter_status(tasks, "open"), do: Enum.reject(tasks, &(&1.status == "done"))
@@ -1091,7 +1091,7 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
         Json.error_body(
           422,
           "validation_failed",
-          "status must be one of todo, in_progress, done.",
+          "status must be one of waiting, todo, in_progress, done.",
           %{
             status: Json.lifecycle()
           }
@@ -1111,23 +1111,7 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
 
         case result do
           {:ok, _} ->
-            reason = reopen_reason(conn, to, a, key)
-
-            Activity.log(action,
-              actor_uuid: ApiKey.accountable_uuid(key),
-              resource_type: "assignment",
-              resource_uuid: a.uuid,
-              target_uuid: Activity.assignee_target_uuid(a),
-              metadata:
-                api_metadata(
-                  key,
-                  if(reason,
-                    do: %{"task" => Assignment.label(a), "reason" => reason},
-                    else: %{"task" => Assignment.label(a)}
-                  )
-                )
-            )
-
+            log_transition(conn, action, a, to, key)
             sync_project_completion(conn)
 
             # the rows the move took with it: the tasks under a completed
@@ -1140,6 +1124,30 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
             Json.changeset_error(cs)
         end
     end
+  end
+
+  defp log_transition(conn, action, a, to, key) do
+    reason = if action == "projects.assignment_reopened", do: reopen_reason(conn, to, a, key)
+
+    # Releasing or idling names no target: the hand-off is the notice
+    # (`Handoffs`), and idle tells nobody.
+    readiness? = action in ["projects.assignment_made_ready", "projects.assignment_made_idle"]
+
+    Activity.log(action,
+      actor_uuid: ApiKey.accountable_uuid(key),
+      resource_type: "assignment",
+      resource_uuid: a.uuid,
+      target_uuid: if(readiness?, do: nil, else: Activity.assignee_target_uuid(a)),
+      tell: not readiness?,
+      metadata:
+        api_metadata(
+          key,
+          if(reason,
+            do: %{"task" => Assignment.label(a), "reason" => reason},
+            else: %{"task" => Assignment.label(a)}
+          )
+        )
+    )
   end
 
   # A reopen's `reason`, as on the project page: posted to the task's
@@ -1208,8 +1216,19 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
       {"projects.assignment_completed",
        Projects.complete_assignment(a, ApiKey.accountable_uuid(key))}
 
+  # Released from waiting ("can be started" — the hand-off tells its
+  # people) or put back to idle; from started or done work, a reopen.
+  defp apply_transition(%Assignment{status: "waiting"} = a, "todo", _key),
+    do:
+      {"projects.assignment_made_ready", Projects.update_assignment_status(a, %{status: "todo"})}
+
   defp apply_transition(a, "todo", _key),
     do: {"projects.assignment_reopened", Projects.reopen_assignment(a)}
+
+  defp apply_transition(%Assignment{status: "todo"} = a, "waiting", _key),
+    do:
+      {"projects.assignment_made_idle",
+       Projects.update_assignment_status(a, %{status: "waiting"})}
 
   defp sync_project_completion(conn) do
     %{pk_api_key: key, pk_project: project} = conn.assigns
@@ -1331,9 +1350,42 @@ defmodule PhoenixKitProjects.Web.Api.TasksController do
       |> maybe_put("position", params["position"] |> then(&if(is_integer(&1), do: &1)))
 
     with {:ok, attrs} <- put_date(attrs, "start_date", params),
-         {:ok, attrs} <- put_date(attrs, "end_date", params) do
+         {:ok, attrs} <- put_date(attrs, "end_date", params),
+         {:ok, attrs} <- put_deadline(attrs, params) do
       checked_attrs(attrs)
     end
+  end
+
+  # By when it has to be done (V26): an ISO 8601 moment with its offset
+  # (`2026-10-29T15:00:00+02:00`), or null to clear. A bare day or a time
+  # without an offset is refused: an agent's clock is not the reader's.
+  defp put_deadline(attrs, params) do
+    case Map.fetch(params, "deadline") do
+      :error ->
+        {:ok, attrs}
+
+      {:ok, nil} ->
+        {:ok, Map.put(attrs, "deadline", nil)}
+
+      {:ok, value} when is_binary(value) ->
+        case DateTime.from_iso8601(value) do
+          {:ok, at, _offset} -> {:ok, Map.put(attrs, "deadline", DateTime.truncate(at, :second))}
+          _ -> deadline_error()
+        end
+
+      {:ok, _} ->
+        deadline_error()
+    end
+  end
+
+  defp deadline_error do
+    {:error,
+     Json.error_body(
+       422,
+       "validation_failed",
+       "deadline must be an ISO 8601 date and time with an offset, e.g. 2026-10-29T15:00:00+02:00.",
+       %{deadline: ["must be a date and time with an offset"]}
+     )}
   end
 
   # A date an agent may set or clear; anything that is not a day is a 422.
